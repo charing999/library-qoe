@@ -29,7 +29,10 @@ from tensorflow.keras.callbacks import EarlyStopping
 from tensorflow.keras.optimizers import Adam
 
 from baseline import evaluate as persistence_scores
-from qoe_features import FEATURES, TIMESTEPS_DEFAULT, make_sequences, prepare
+from qoe_features import (
+    FEATURES, GROUP_KEY, TIMESTEPS_DEFAULT, make_sequences, prepare,
+)
+from transition_metrics import report as transition_report
 
 SEED = 42
 EPOCHS = 50
@@ -98,18 +101,34 @@ def build_transformer(input_shape):
 
 
 def split_and_scale(df, timesteps, test_ratio=0.2):
-    X_all = df[FEATURES].values
-    y_all = df["QoE_index_future"].values
+    """AP별로 뒤쪽 test_ratio를 테스트로 뗀다.
 
-    split_idx = int(len(df) * (1 - test_ratio))
+    AP를 섞어 한 번에 자르면 어떤 AP는 학습에만, 어떤 AP는 테스트에만 들어간다.
+    """
+    train_idx, test_idx = [], []
+    for _, g in df.groupby(GROUP_KEY, sort=False):
+        cut = int(len(g) * (1 - test_ratio))
+        train_idx.extend(g.index[:cut])
+        test_idx.extend(g.index[cut:])
+
+    train_df = df.loc[sorted(train_idx)]
+    test_df = df.loc[sorted(test_idx)]
+
     scaler = StandardScaler()
-    X_train = scaler.fit_transform(X_all[:split_idx])
-    X_test = scaler.transform(X_all[split_idx:])
-    y_train, y_test = y_all[:split_idx], y_all[split_idx:]
+    X_train = scaler.fit_transform(train_df[FEATURES].values)
+    X_test = scaler.transform(test_df[FEATURES].values)
+    y_train = train_df["QoE_index_future"].values
+    y_test = test_df["QoE_index_future"].values
 
-    train_seq = make_sequences(X_train, y_train, timesteps)
-    test_seq = make_sequences(X_test, y_test, timesteps)
-    return train_seq, test_seq, y_train, scaler
+    g_train = train_df[GROUP_KEY].values
+    g_test = test_df[GROUP_KEY].values
+
+    Xtr, ytr, _ = make_sequences(X_train, y_train, timesteps, g_train)
+    Xte, yte, keep = make_sequences(X_test, y_test, timesteps, g_test)
+
+    # 기준선 비교용: 예측 시점의 현재 QoE
+    current_test = test_df["QoE_index"].values[keep]
+    return (Xtr, ytr), (Xte, yte), y_train, current_test
 
 
 def to_class(arr, t1, t2):
@@ -122,8 +141,8 @@ def main(args):
     configure_gpu()
 
     df = prepare(args.csv, horizon=args.horizon)
-    (X_train_seq, y_train_seq), (X_test_seq, y_test_seq), y_train, _ = split_and_scale(
-        df, args.timesteps
+    (X_train_seq, y_train_seq), (X_test_seq, y_test_seq), y_train, current_test = (
+        split_and_scale(df, args.timesteps)
     )
     print(f"[INFO] Train shape: {X_train_seq.shape}, Test shape: {X_test_seq.shape}")
 
@@ -164,8 +183,11 @@ def main(args):
         "MAE": mean_absolute_error(y_test_seq, pred_lgb),
     }
 
-    base = persistence_scores(args.csv, timesteps=args.timesteps, horizon=args.horizon)
-    results["Persistence"] = {"MSE": base["MSE"], "MAE": base["MAE"]}
+    predictions["Persistence"] = current_test
+    results["Persistence"] = {
+        "MSE": mean_squared_error(y_test_seq, current_test),
+        "MAE": mean_absolute_error(y_test_seq, current_test),
+    }
 
     metrics_df = pd.DataFrame(results).T.sort_values("MSE")
     print("\n[Regression Metrics Comparison]")
@@ -173,9 +195,6 @@ def main(args):
 
     q1, q2 = np.quantile(y_train, 0.33), np.quantile(y_train, 0.66)
     y_true_cls = to_class(y_test_seq, q1, q2)
-    # 기준선도 같은 표에 넣어야 비교가 된다.
-    start = int(len(df) * 0.8) + args.timesteps
-    predictions["Persistence"] = df["QoE_index"].values[start:]
     print(f"\n[Thresholds] Good(~{q1:.3f}) / Moderate(~{q2:.3f}) / Bad")
     print(f"\n{'Model':<15} | {'Accuracy':<8} | {'F1-Macro':<8}")
     print("-" * 40)
@@ -185,6 +204,16 @@ def main(args):
                                        zero_division=0)
         acc = accuracy_score(y_true_cls, pred_cls)
         print(f"{name:<15} | {acc:.4f}   | {report['macro avg']['f1-score']:.4f}")
+
+    print("\n[전이 검출 관점] 상태가 바뀌는 순간만 떼어 평가")
+    print(f"{'Model':<13} | {'전이재현':<8} | {'전이정밀':<8} | "
+          f"{'악화F1':<7} | {'헛경보':<7} | {'방향일치':<8}")
+    print("-" * 72)
+    for name, pred in predictions.items():
+        r = transition_report(name, y_test_seq, pred, current_test, q1, q2)
+        print(f"{name:<13} | {r['transition_recall']:.4f}   | "
+              f"{r['transition_precision']:.4f}   | {r['degradation_f1']:.4f}  | "
+              f"{r['false_alarm_rate']:.4f}  | {r['direction_acc']:.4f}")
 
     if args.plot:
         os.makedirs(args.outdir, exist_ok=True)

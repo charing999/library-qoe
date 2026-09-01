@@ -21,9 +21,12 @@ WEIGHTS = {
     "norm_clients": 0.05,
 }
 
-EWM_SPAN = 12  # 5분 간격 로그 기준 약 1시간 평활
+# 수집 간격은 AP당 중앙값 1분이다. span=12는 약 12분 평활에 해당한다.
+EWM_SPAN = 12
 
-TIMESTEPS_DEFAULT = 6  # 30분치 시퀀스를 보고 5분 뒤를 예측
+TIMESTEPS_DEFAULT = 6  # 12분치 시퀀스
+
+GROUP_KEY = "ap_code"  # AP 4대가 한 파일에 섞여 있어 반드시 나눠서 처리한다
 
 NUMERIC_COLS = [
     "ping_ms", "ping_jitter_ms", "packet_loss_rate",
@@ -72,8 +75,12 @@ def load_dataset(path):
     return df.dropna(subset=present).reset_index(drop=True)
 
 
-def add_qoe_index(df):
-    """가중합 저하 점수를 만든 뒤 EWM으로 평활해 QoE_index를 붙인다."""
+def add_qoe_index(df, group_key=GROUP_KEY):
+    """가중합 저하 점수를 만든 뒤 EWM으로 평활해 QoE_index를 붙인다.
+
+    평활은 AP별로 따로 건다. 한 파일에 여러 AP가 시간순으로 섞여 있어서
+    전체에 한 번에 걸면 다른 층의 값이 서로 스며든다.
+    """
     df["norm_ping"] = log_norm_bad(df["ping_ms"], MAX_PING)
     df["norm_jitter"] = log_norm_bad(df["ping_jitter_ms"], MAX_JITTER)
     df["norm_loss"] = log_norm_bad(df["packet_loss_rate"], MAX_LOSS)
@@ -85,36 +92,60 @@ def add_qoe_index(df):
     for col, w in WEIGHTS.items():
         bad_score += df[col].values * w
 
-    df["QoE_index"] = clamp(
-        pd.Series(bad_score).ewm(span=EWM_SPAN, adjust=False).mean()
-    )
+    df["bad_score"] = bad_score
+    if group_key in df.columns:
+        smoothed = df.groupby(group_key)["bad_score"].transform(
+            lambda s: s.ewm(span=EWM_SPAN, adjust=False).mean()
+        )
+    else:
+        smoothed = df["bad_score"].ewm(span=EWM_SPAN, adjust=False).mean()
+
+    df["QoE_index"] = clamp(smoothed)
     return df
 
 
-def add_features(df):
+def add_features(df, group_key=GROUP_KEY):
+    """차분도 AP별로 계산한다. 전체에 걸면 AP 경계에서 엉뚱한 값이 나온다."""
     df["log_download"] = np.log1p(df["download_Mbps"])
     df["log_upload"] = np.log1p(df["upload_Mbps"])
     for col in ("ping_ms", "download_Mbps"):
-        df[f"{col}_diff"] = df[col].diff().fillna(0)
+        if group_key in df.columns:
+            df[f"{col}_diff"] = df.groupby(group_key)[col].diff().fillna(0)
+        else:
+            df[f"{col}_diff"] = df[col].diff().fillna(0)
     return df
 
 
-def add_target(df, horizon=1):
-    """horizon 스텝(수집 간격 5분) 뒤의 QoE를 타깃으로 둔다."""
-    df["QoE_index_future"] = df["QoE_index"].shift(-horizon)
+def add_target(df, horizon=1, group_key=GROUP_KEY):
+    """horizon 스텝 뒤의 QoE를 타깃으로 둔다. 시프트도 AP별로 한다."""
+    if group_key in df.columns:
+        df["QoE_index_future"] = df.groupby(group_key)["QoE_index"].shift(-horizon)
+    else:
+        df["QoE_index_future"] = df["QoE_index"].shift(-horizon)
     return df.dropna(subset=["QoE_index_future"]).reset_index(drop=True)
 
 
-def prepare(path, horizon=1):
+def prepare(path, horizon=1, group_key=GROUP_KEY, sort=True):
+    """AP별로 정렬한 뒤 지표·피처·타깃을 만든다.
+
+    AP별로 묶어 두면 시퀀스를 자를 때도 한 AP 안에서만 잘린다.
+    """
     df = load_dataset(path)
-    df = add_qoe_index(df)
-    df = add_features(df)
-    return add_target(df, horizon=horizon)
+    if sort and group_key in df.columns and "datetime" in df.columns:
+        df["_dt"] = pd.to_datetime(df["datetime"], errors="coerce")
+        df = df.sort_values([group_key, "_dt"]).drop(columns="_dt").reset_index(drop=True)
+    df = add_qoe_index(df, group_key)
+    df = add_features(df, group_key)
+    return add_target(df, horizon=horizon, group_key=group_key)
 
 
-def make_sequences(X, y, timesteps):
-    xs, ys = [], []
+def make_sequences(X, y, timesteps, groups=None):
+    """시퀀스를 자른다. groups를 주면 AP 경계를 넘는 시퀀스는 버린다."""
+    xs, ys, keep = [], [], []
     for i in range(timesteps, len(X)):
+        if groups is not None and len(set(groups[i - timesteps:i + 1])) > 1:
+            continue
         xs.append(X[i - timesteps:i])
         ys.append(y[i])
-    return np.array(xs), np.array(ys)
+        keep.append(i)
+    return np.array(xs), np.array(ys), np.array(keep)
