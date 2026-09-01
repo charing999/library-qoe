@@ -11,7 +11,7 @@ venv/
 *.egg-info/
 
 # 학습 산출물
-ml/figures/
+# ml/figures/ 는 결과 공유를 위해 커밋한다
 .ipynb_checkpoints/
 
 # OS

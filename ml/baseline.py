@@ -18,8 +18,8 @@ DEFAULT_CSV = os.path.join(
 )
 
 
-def evaluate(csv_path, timesteps=TIMESTEPS_DEFAULT, test_ratio=0.2):
-    df = prepare(csv_path)
+def evaluate(csv_path, timesteps=TIMESTEPS_DEFAULT, test_ratio=0.2, horizon=1):
+    df = prepare(csv_path, horizon=horizon)
 
     split_idx = int(len(df) * (1 - test_ratio))
     qoe = df["QoE_index"].values
@@ -39,9 +39,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--csv", default=DEFAULT_CSV)
     parser.add_argument("--timesteps", type=int, default=TIMESTEPS_DEFAULT)
+    parser.add_argument("--horizon", type=int, default=1, help="몇 스텝(5분) 뒤를 예측할지")
     args = parser.parse_args()
 
-    scores = evaluate(args.csv, timesteps=args.timesteps)
-    print("[Persistence baseline] QoE(t+1) = QoE(t)")
+    scores = evaluate(args.csv, timesteps=args.timesteps, horizon=args.horizon)
+    print(f"[Persistence baseline] QoE(t+{args.horizon}) = QoE(t)")
     for k, v in scores.items():
         print(f"  {k:<6} {v:.6f}" if isinstance(v, float) else f"  {k:<6} {v}")

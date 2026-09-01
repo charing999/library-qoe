@@ -121,7 +121,7 @@ def main(args):
     set_seeds()
     configure_gpu()
 
-    df = prepare(args.csv)
+    df = prepare(args.csv, horizon=args.horizon)
     (X_train_seq, y_train_seq), (X_test_seq, y_test_seq), y_train, _ = split_and_scale(
         df, args.timesteps
     )
@@ -164,7 +164,7 @@ def main(args):
         "MAE": mean_absolute_error(y_test_seq, pred_lgb),
     }
 
-    base = persistence_scores(args.csv, timesteps=args.timesteps)
+    base = persistence_scores(args.csv, timesteps=args.timesteps, horizon=args.horizon)
     results["Persistence"] = {"MSE": base["MSE"], "MAE": base["MAE"]}
 
     metrics_df = pd.DataFrame(results).T.sort_values("MSE")
@@ -173,6 +173,9 @@ def main(args):
 
     q1, q2 = np.quantile(y_train, 0.33), np.quantile(y_train, 0.66)
     y_true_cls = to_class(y_test_seq, q1, q2)
+    # 기준선도 같은 표에 넣어야 비교가 된다.
+    start = int(len(df) * 0.8) + args.timesteps
+    predictions["Persistence"] = df["QoE_index"].values[start:]
     print(f"\n[Thresholds] Good(~{q1:.3f}) / Moderate(~{q2:.3f}) / Bad")
     print(f"\n{'Model':<15} | {'Accuracy':<8} | {'F1-Macro':<8}")
     print("-" * 40)
@@ -200,9 +203,10 @@ def main(args):
         plt.plot(y_test_seq[:subset], label="Actual", color="black",
                  linewidth=2, alpha=0.7)
         styles = {"GRU": ("red", "--"), "CNN-LSTM": ("blue", "-."),
-                  "Transformer": ("green", ":"), "LightGBM": ("orange", "--")}
+                  "Transformer": ("green", ":"), "LightGBM": ("orange", "--"),
+                  "Persistence": ("gray", "-")}
         for name, pred in predictions.items():
-            color, style = styles[name]
+            color, style = styles.get(name, ("purple", "--"))
             plt.plot(pred[:subset], label=name, color=color, linestyle=style, alpha=0.8)
         plt.title(f"Future QoE prediction (first {subset} test samples)")
         plt.xlabel("Time step")
@@ -218,6 +222,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--csv", default=DEFAULT_CSV)
     parser.add_argument("--timesteps", type=int, default=TIMESTEPS_DEFAULT)
+    parser.add_argument("--horizon", type=int, default=1, help="몇 스텝(5분) 뒤를 예측할지")
     parser.add_argument("--outdir", default=os.path.join(os.path.dirname(__file__), "figures"))
     parser.add_argument("--plot", action="store_true")
     args = parser.parse_args()
